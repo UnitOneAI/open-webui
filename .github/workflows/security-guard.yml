@@ -419,15 +419,11 @@ jobs:
 
           if [ "$HTTP_CODE" = "201" ]; then
             TICKET_KEY=$(echo "$BODY" | jq -r '.key // ""')
+            echo "DEBUG: Extracted TICKET_KEY=$TICKET_KEY"
+            echo "DEBUG: JIRA_URL env=$JIRA_URL"
             if [ -n "$TICKET_KEY" ] && [ "$TICKET_KEY" != "null" ]; then
-              # Construct full Jira URL - ensure base URL has https://
-              JIRA_BASE="${JIRA_URL%/}"  # Remove trailing slash if present
-              if [ -z "$JIRA_BASE" ]; then
-                JIRA_BASE="https://unitoneai.atlassian.net"
-              elif [[ "$JIRA_BASE" != http* ]]; then
-                JIRA_BASE="https://${JIRA_BASE}"
-              fi
-              JIRA_TICKET_URL="${JIRA_BASE}/browse/${TICKET_KEY}"
+              # Always use hardcoded Jira base URL for reliability
+              JIRA_TICKET_URL="https://unitoneai.atlassian.net/browse/${TICKET_KEY}"
               echo "jira_url=$JIRA_TICKET_URL" >> $GITHUB_OUTPUT
               echo "jira_key=$TICKET_KEY" >> $GITHUB_OUTPUT
               echo "✅ Jira ticket created: $JIRA_TICKET_URL"
