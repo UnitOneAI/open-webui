@@ -159,11 +159,14 @@ async def get_function_models(request):
 async def generate_function_chat_completion(
     request, form_data, user, models: dict = {}
 ):
-    async def execute_pipe(pipe, params):
+    async def execute_pipe(pipe, params, allowed_params):
+        # Filter params to only include allowed parameters
+        filtered_params = {k: v for k, v in params.items() if k in allowed_params}
+        
         if inspect.iscoroutinefunction(pipe):
-            return await pipe(**params)
+            return await pipe(**filtered_params)
         else:
-            return pipe(**params)
+            return pipe(**filtered_params)
 
     async def get_message_content(res: str | Generator | AsyncGenerator) -> str:
         if isinstance(res, str):
@@ -294,12 +297,16 @@ async def generate_function_chat_completion(
 
     pipe = function_module.pipe
     params = get_function_params(function_module, form_data, user, extra_params)
+    
+    # Get allowed parameters from function signature
+    sig = inspect.signature(pipe)
+    allowed_params = set(sig.parameters.keys())
 
     if form_data.get("stream", False):
 
         async def stream_content():
             try:
-                res = await execute_pipe(pipe, params)
+                res = await execute_pipe(pipe, params, allowed_params)
 
                 # Directly return if the response is a StreamingResponse
                 if isinstance(res, StreamingResponse):
@@ -338,7 +345,7 @@ async def generate_function_chat_completion(
         return StreamingResponse(stream_content(), media_type="text/event-stream")
     else:
         try:
-            res = await execute_pipe(pipe, params)
+            res = await execute_pipe(pipe, params, allowed_params)
 
         except Exception as e:
             log.error(f"Error: {e}")
