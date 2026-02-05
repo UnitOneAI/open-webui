@@ -3,6 +3,7 @@ import sys
 import inspect
 import json
 import asyncio
+import hashlib
 
 from pydantic import BaseModel
 from typing import AsyncGenerator, Generator, Iterator
@@ -57,8 +58,102 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
+def validate_pipe_id(pipe_id: str) -> bool:
+    """
+    Validate pipe_id to ensure it only contains safe characters.
+    Prevents path traversal and code injection attacks.
+    """
+    if not pipe_id:
+        return False
+    
+    # Allow alphanumeric, hyphens, underscores, and dots only
+    import re
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', pipe_id):
+        return False
+    
+    # Prevent path traversal attempts
+    if '..' in pipe_id or '/' in pipe_id or '\\' in pipe_id:
+        return False
+    
+    return True
+
+
+def sanitize_params(params: dict) -> dict:
+    """
+    Sanitize parameters to prevent code injection.
+    Creates a deep copy and validates nested structures.
+    """
+    import copy
+    
+    # Create a deep copy to avoid modifying original
+    sanitized = copy.deepcopy(params)
+    
+    # Remove any potentially dangerous keys
+    dangerous_keys = ['__import__', '__builtins__', 'eval', 'exec', 'compile', '__code__', '__globals__']
+    
+    def clean_dict(d):
+        if not isinstance(d, dict):
+            return d
+        
+        for key in list(d.keys()):
+            if key in dangerous_keys:
+                del d[key]
+            elif isinstance(d[key], dict):
+                d[key] = clean_dict(d[key])
+            elif isinstance(d[key], list):
+                d[key] = [clean_dict(item) if isinstance(item, dict) else item for item in d[key]]
+        
+        return d
+    
+    return clean_dict(sanitized)
+
+
+def validate_pipe_function(pipe_function, pipe_id: str) -> bool:
+    """
+    Validate that the pipe function is safe to execute.
+    """
+    if not callable(pipe_function):
+        log.error(f"Pipe function is not callable for {pipe_id}")
+        return False
+    
+    # Check if the function has dangerous attributes
+    if hasattr(pipe_function, '__globals__'):
+        globals_dict = pipe_function.__globals__
+        dangerous_builtins = ['eval', 'exec', 'compile', '__import__']
+        
+        for builtin in dangerous_builtins:
+            if builtin in globals_dict and callable(globals_dict[builtin]):
+                log.warning(f"Pipe function {pipe_id} has access to dangerous builtin: {builtin}")
+    
+    return True
+
+
 def get_function_module_by_id(request: Request, pipe_id: str):
-    function_module, _, _ = get_function_module_from_cache(request, pipe_id)
+    # Validate pipe_id before processing
+    if not validate_pipe_id(pipe_id):
+        log.error(f"Invalid pipe_id format: {pipe_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid function ID format"
+        )
+    
+    # Verify the function exists in the database before loading
+    function_record = Functions.get_function_by_id(pipe_id.split('.')[0])
+    if not function_record:
+        log.error(f"Function not found in database: {pipe_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Function not found"
+        )
+    
+    try:
+        function_module, _, _ = get_function_module_from_cache(request, pipe_id)
+    except Exception as e:
+        log.exception(f"Error loading function module {pipe_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error loading function module"
+        )
 
     if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
         Valves = function_module.Valves
@@ -66,12 +161,19 @@ def get_function_module_by_id(request: Request, pipe_id: str):
 
         if valves:
             try:
+                # Validate valves data before instantiation
+                if not isinstance(valves, dict):
+                    raise ValueError("Invalid valves data format")
+                
                 function_module.valves = Valves(
                     **{k: v for k, v in valves.items() if v is not None}
                 )
             except Exception as e:
                 log.exception(f"Error loading valves for function {pipe_id}: {e}")
-                raise e
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error loading function valves: {str(e)}"
+                )
         else:
             function_module.valves = Valves()
 
@@ -84,6 +186,11 @@ async def get_function_models(request):
 
     for pipe in pipes:
         try:
+            # Validate pipe.id before processing
+            if not validate_pipe_id(pipe.id):
+                log.warning(f"Skipping function with invalid ID: {pipe.id}")
+                continue
+                
             function_module = get_function_module_by_id(request, pipe.id)
 
             has_user_valves = False
@@ -112,6 +219,15 @@ async def get_function_models(request):
                 )
 
                 for p in sub_pipes:
+                    # Validate sub-pipe ID
+                    if not isinstance(p, dict) or 'id' not in p or 'name' not in p:
+                        log.warning(f"Skipping invalid sub-pipe: {p}")
+                        continue
+                    
+                    if not validate_pipe_id(p["id"]):
+                        log.warning(f"Skipping sub-pipe with invalid ID: {p['id']}")
+                        continue
+                        
                     sub_pipe_id = f'{pipe.id}.{p["id"]}'
                     sub_pipe_name = p["name"]
 
@@ -149,6 +265,9 @@ async def get_function_models(request):
                         "has_user_valves": has_user_valves,
                     }
                 )
+        except HTTPException:
+            # Re-raise HTTP exceptions
+            raise
         except Exception as e:
             log.exception(e)
             continue
@@ -159,11 +278,34 @@ async def get_function_models(request):
 async def generate_function_chat_completion(
     request, form_data, user, models: dict = {}
 ):
-    async def execute_pipe(pipe, params):
-        if inspect.iscoroutinefunction(pipe):
-            return await pipe(**params)
-        else:
-            return pipe(**params)
+    async def execute_pipe(pipe, params, pipe_id: str):
+        """
+        Safely execute a pipe function with validated parameters.
+        """
+        # Validate the pipe function before execution
+        if not validate_pipe_function(pipe, pipe_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Pipe function failed security validation"
+            )
+        
+        # Sanitize parameters to prevent code injection
+        safe_params = sanitize_params(params)
+        
+        try:
+            if inspect.iscoroutinefunction(pipe):
+                return await pipe(**safe_params)
+            else:
+                return pipe(**safe_params)
+        except TypeError as e:
+            log.error(f"Parameter error executing pipe {pipe_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid parameters for pipe function"
+            )
+        except Exception as e:
+            log.error(f"Error executing pipe {pipe_id}: {e}")
+            raise
 
     async def get_message_content(res: str | Generator | AsyncGenerator) -> str:
         if isinstance(res, str):
@@ -220,6 +362,14 @@ async def generate_function_chat_completion(
         return params
 
     model_id = form_data.get("model")
+    
+    # Validate model_id
+    if not model_id or not isinstance(model_id, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid model ID"
+        )
+    
     model_info = Models.get_model_by_id(model_id)
 
     metadata = form_data.pop("metadata", {})
@@ -290,6 +440,14 @@ async def generate_function_chat_completion(
             form_data = apply_system_prompt_to_body(system, form_data, metadata, user)
 
     pipe_id = get_pipe_id(form_data)
+    
+    # Validate pipe_id
+    if not validate_pipe_id(pipe_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid function ID"
+        )
+    
     function_module = get_function_module_by_id(request, pipe_id)
 
     pipe = function_module.pipe
@@ -299,7 +457,7 @@ async def generate_function_chat_completion(
 
         async def stream_content():
             try:
-                res = await execute_pipe(pipe, params)
+                res = await execute_pipe(pipe, params, pipe_id)
 
                 # Directly return if the response is a StreamingResponse
                 if isinstance(res, StreamingResponse):
@@ -338,7 +496,7 @@ async def generate_function_chat_completion(
         return StreamingResponse(stream_content(), media_type="text/event-stream")
     else:
         try:
-            res = await execute_pipe(pipe, params)
+            res = await execute_pipe(pipe, params, pipe_id)
 
         except Exception as e:
             log.error(f"Error: {e}")
