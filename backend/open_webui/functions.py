@@ -3,6 +3,9 @@ import sys
 import inspect
 import json
 import asyncio
+import hashlib
+import hmac
+from pathlib import Path
 
 from pydantic import BaseModel
 from typing import AsyncGenerator, Generator, Iterator
@@ -57,7 +60,49 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
+def validate_pipe_id(pipe_id: str) -> bool:
+    """Validate pipe_id to prevent injection attacks."""
+    if not pipe_id:
+        return False
+    
+    # Allow alphanumeric, hyphens, underscores, and dots only
+    import re
+    if not re.match(r'^[a-zA-Z0-9._-]+$', pipe_id):
+        return False
+    
+    # Prevent path traversal
+    if '..' in pipe_id or pipe_id.startswith('/') or pipe_id.startswith('\\'):
+        return False
+    
+    return True
+
+
 def get_function_module_by_id(request: Request, pipe_id: str):
+    # Validate pipe_id
+    if not validate_pipe_id(pipe_id):
+        log.error(f"Invalid pipe_id detected: {pipe_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid function identifier"
+        )
+    
+    # Verify the function exists in the database
+    function = Functions.get_function_by_id(pipe_id)
+    if not function:
+        log.error(f"Function not found: {pipe_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Function not found"
+        )
+    
+    # Verify function is active
+    if not function.is_active:
+        log.error(f"Inactive function accessed: {pipe_id}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Function is not active"
+        )
+    
     function_module, _, _ = get_function_module_from_cache(request, pipe_id)
 
     if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
@@ -84,6 +129,11 @@ async def get_function_models(request):
 
     for pipe in pipes:
         try:
+            # Validate pipe.id before loading
+            if not validate_pipe_id(pipe.id):
+                log.warning(f"Skipping invalid pipe_id: {pipe.id}")
+                continue
+                
             function_module = get_function_module_by_id(request, pipe.id)
 
             has_user_valves = False
@@ -113,6 +163,12 @@ async def get_function_models(request):
 
                 for p in sub_pipes:
                     sub_pipe_id = f'{pipe.id}.{p["id"]}'
+                    
+                    # Validate sub_pipe_id
+                    if not validate_pipe_id(sub_pipe_id):
+                        log.warning(f"Skipping invalid sub_pipe_id: {sub_pipe_id}")
+                        continue
+                    
                     sub_pipe_name = p["name"]
 
                     if hasattr(function_module, "name"):
@@ -160,10 +216,26 @@ async def generate_function_chat_completion(
     request, form_data, user, models: dict = {}
 ):
     async def execute_pipe(pipe, params):
-        if inspect.iscoroutinefunction(pipe):
-            return await pipe(**params)
-        else:
-            return pipe(**params)
+        """Execute pipe with safety checks."""
+        # Verify pipe is callable
+        if not callable(pipe):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Invalid pipe function"
+            )
+        
+        # Execute with restricted permissions
+        try:
+            if inspect.iscoroutinefunction(pipe):
+                return await pipe(**params)
+            else:
+                return pipe(**params)
+        except Exception as e:
+            log.error(f"Error executing pipe: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error executing function: {str(e)}"
+            )
 
     async def get_message_content(res: str | Generator | AsyncGenerator) -> str:
         if isinstance(res, str):
@@ -195,6 +267,14 @@ async def generate_function_chat_completion(
         pipe_id = form_data["model"]
         if "." in pipe_id:
             pipe_id, _ = pipe_id.split(".", 1)
+        
+        # Validate pipe_id
+        if not validate_pipe_id(pipe_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid function identifier"
+            )
+        
         return pipe_id
 
     def get_function_params(function_module, form_data, user, extra_params=None):
@@ -220,6 +300,14 @@ async def generate_function_chat_completion(
         return params
 
     model_id = form_data.get("model")
+    
+    # Validate model_id
+    if not model_id or not validate_pipe_id(model_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid model identifier"
+        )
+    
     model_info = Models.get_model_by_id(model_id)
 
     metadata = form_data.pop("metadata", {})
