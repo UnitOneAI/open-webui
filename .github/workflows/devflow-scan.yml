@@ -1,0 +1,37 @@
+name: DevFlow Security Scan
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+jobs:
+  devflow-scan:
+    name: Scan Repository with DevFlow
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install unitoneflow
+        run: |
+          pip install https://devflow-scanned-repos-dev.s3.us-west-2.amazonaws.com/public/wheels/unitoneflow-1.0.0-py3-none-any.whl
+
+      - name: Run DevFlow scan
+        run: |
+          mkdir -p .devflow
+          python -m unitoneflow scan . \
+            --manifest-file .devflow/manifest.json \
+            --no-interactive
