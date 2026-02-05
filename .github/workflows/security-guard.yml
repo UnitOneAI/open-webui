@@ -385,7 +385,7 @@ jobs:
                     }]
                   }]
                 },
-                \"issuetype\": {\"name\": \"Bug\"},
+                \"issuetype\": {\"name\": \"Task\"},
                 \"priority\": {\"name\": \"$PRIORITY\"},
                 \"labels\": [\"security\", \"automated\", \"unitoneflow\"]
               }
@@ -421,19 +421,41 @@ jobs:
         run: |
           echo "## 🔒 Security Guard Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Scan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Vulnerabilities Found:** ${{ steps.detect.outputs.count || '0' }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
 
+          # Links section
           if [ "${{ steps.create_pr.outputs.pr_url }}" != "" ]; then
             echo "### 📝 Pull Request" >> $GITHUB_STEP_SUMMARY
-            echo "**${{ steps.create_pr.outputs.pr_url }}**" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.create_pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
           if [ "${{ steps.create_jira.outputs.jira_url }}" != "" ]; then
             echo "### 🎫 Jira Ticket" >> $GITHUB_STEP_SUMMARY
-            echo "**${{ steps.create_jira.outputs.jira_url }}**" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.create_jira.outputs.jira_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "### 📊 Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vulnerabilities Found:** ${{ steps.detect.outputs.count || '0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Vulnerability table
+          if [ -f backend/security-report.json ]; then
+            echo "### 🔍 Vulnerabilities Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Type | File | Line |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|------|------|------|" >> $GITHUB_STEP_SUMMARY
+
+            python3 -c "
+          import json
+          report = json.loads(open('backend/security-report.json').read())
+          for v in report.get('vulnerabilities', [])[:15]:
+              sev = v.get('severity', 'unknown').upper()
+              vtype = v.get('vulnerability_type', 'Unknown')
+              fp = v.get('file_path', 'unknown')
+              line = v.get('line_number', '?')
+              print(f'| {sev} | {vtype} | \`{fp}\` | {line} |')
+          " >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
