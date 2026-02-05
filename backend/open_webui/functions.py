@@ -3,8 +3,11 @@ import sys
 import inspect
 import json
 import asyncio
+import hashlib
+import hmac
+from datetime import datetime, timedelta
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from typing import AsyncGenerator, Generator, Iterator
 from fastapi import (
     Depends,
@@ -57,7 +60,84 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
+# Store for function code signatures to detect tampering
+_function_signatures = {}
+
+
+def _compute_function_signature(function_id: str, code: str) -> str:
+    """Compute a signature for function code to detect tampering."""
+    return hashlib.sha256(f"{function_id}:{code}".encode()).hexdigest()
+
+
+def _verify_function_integrity(function_id: str, code: str) -> bool:
+    """Verify that function code hasn't been tampered with since loading."""
+    if function_id not in _function_signatures:
+        # First time loading, store signature
+        _function_signatures[function_id] = _compute_function_signature(function_id, code)
+        return True
+    
+    current_signature = _compute_function_signature(function_id, code)
+    expected_signature = _function_signatures[function_id]
+    
+    if current_signature != expected_signature:
+        log.error(f"Function code integrity check failed for {function_id}")
+        return False
+    
+    return True
+
+
+def _validate_pipes_output(pipes_output) -> bool:
+    """Validate that pipes output is safe and expected format."""
+    if not isinstance(pipes_output, list):
+        log.error(f"Invalid pipes output: expected list, got {type(pipes_output)}")
+        return False
+    
+    for pipe in pipes_output:
+        if not isinstance(pipe, dict):
+            log.error(f"Invalid pipe in pipes output: expected dict, got {type(pipe)}")
+            return False
+        
+        if "id" not in pipe or "name" not in pipe:
+            log.error(f"Invalid pipe in pipes output: missing required fields 'id' or 'name'")
+            return False
+        
+        # Validate id and name are strings
+        if not isinstance(pipe["id"], str) or not isinstance(pipe["name"], str):
+            log.error(f"Invalid pipe in pipes output: 'id' and 'name' must be strings")
+            return False
+        
+        # Validate id doesn't contain path traversal or injection patterns
+        if any(char in pipe["id"] for char in ["../", "..\\", "\0", "\n", "\r"]):
+            log.error(f"Invalid pipe id: contains forbidden characters")
+            return False
+    
+    return True
+
+
 def get_function_module_by_id(request: Request, pipe_id: str):
+    # Validate that the function exists in the database and is active
+    function = Functions.get_function_by_id(pipe_id)
+    if not function:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Function with id '{pipe_id}' not found"
+        )
+    
+    # Validate that the function is active
+    if not function.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Function with id '{pipe_id}' is not active"
+        )
+    
+    # Verify function code integrity
+    if hasattr(function, 'content') and function.content:
+        if not _verify_function_integrity(pipe_id, function.content):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Function code integrity check failed"
+            )
+    
     function_module, _, _ = get_function_module_from_cache(request, pipe_id)
 
     if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
@@ -66,12 +146,36 @@ def get_function_module_by_id(request: Request, pipe_id: str):
 
         if valves:
             try:
-                function_module.valves = Valves(
-                    **{k: v for k, v in valves.items() if v is not None}
-                )
+                # Validate that valves is a dict
+                if not isinstance(valves, dict):
+                    log.error(f"Invalid valves type for function {pipe_id}: expected dict, got {type(valves)}")
+                    raise ValueError("Invalid valves data type")
+                
+                # Filter valves to only include fields defined in the Valves model
+                if issubclass(Valves, BaseModel):
+                    valid_fields = set(Valves.model_fields.keys())
+                    filtered_valves = {
+                        k: v for k, v in valves.items() 
+                        if v is not None and k in valid_fields
+                    }
+                    
+                    # Use Pydantic validation to safely instantiate Valves
+                    function_module.valves = Valves.model_validate(filtered_valves)
+                else:
+                    # Fallback for non-Pydantic Valves classes
+                    filtered_valves = {k: v for k, v in valves.items() if v is not None}
+                    function_module.valves = Valves(**filtered_valves)
+                    
+            except ValidationError as e:
+                log.exception(f"Validation error loading valves for function {pipe_id}: {e}")
+                # Use default valves on validation error
+                function_module.valves = Valves()
             except Exception as e:
                 log.exception(f"Error loading valves for function {pipe_id}: {e}")
-                raise e
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error loading function configuration"
+                )
         else:
             function_module.valves = Valves()
 
@@ -97,14 +201,37 @@ async def get_function_models(request):
                 # Handle pipes being a list, sync function, or async function
                 try:
                     if callable(function_module.pipes):
+                        # Verify the function is safe to call
+                        if not hasattr(function_module, '__name__'):
+                            log.error(f"Function module for {pipe.id} is missing __name__ attribute")
+                            continue
+                        
+                        # Execute with timeout to prevent DoS
                         if asyncio.iscoroutinefunction(function_module.pipes):
-                            sub_pipes = await function_module.pipes()
+                            sub_pipes = await asyncio.wait_for(
+                                function_module.pipes(), 
+                                timeout=5.0
+                            )
                         else:
-                            sub_pipes = function_module.pipes()
+                            # Run sync function in executor with timeout
+                            loop = asyncio.get_event_loop()
+                            sub_pipes = await asyncio.wait_for(
+                                loop.run_in_executor(None, function_module.pipes),
+                                timeout=5.0
+                            )
                     else:
                         sub_pipes = function_module.pipes
+                    
+                    # Validate the output
+                    if not _validate_pipes_output(sub_pipes):
+                        log.error(f"Invalid pipes output for function {pipe.id}")
+                        continue
+                        
+                except asyncio.TimeoutError:
+                    log.error(f"Timeout executing pipes() for function {pipe.id}")
+                    sub_pipes = []
                 except Exception as e:
-                    log.exception(e)
+                    log.exception(f"Error executing pipes() for function {pipe.id}: {e}")
                     sub_pipes = []
 
                 log.debug(
@@ -212,7 +339,24 @@ async def generate_function_chat_completion(
         if "__user__" in params and hasattr(function_module, "UserValves"):
             user_valves = Functions.get_user_valves_by_id_and_user_id(pipe_id, user.id)
             try:
-                params["__user__"]["valves"] = function_module.UserValves(**user_valves)
+                # Validate user_valves is a dict
+                if not isinstance(user_valves, dict):
+                    log.error(f"Invalid user_valves type: expected dict, got {type(user_valves)}")
+                    params["__user__"]["valves"] = function_module.UserValves()
+                else:
+                    # Validate and filter user valves
+                    if issubclass(function_module.UserValves, BaseModel):
+                        valid_fields = set(function_module.UserValves.model_fields.keys())
+                        filtered_user_valves = {
+                            k: v for k, v in user_valves.items() 
+                            if k in valid_fields
+                        }
+                        params["__user__"]["valves"] = function_module.UserValves.model_validate(filtered_user_valves)
+                    else:
+                        params["__user__"]["valves"] = function_module.UserValves(**user_valves)
+            except ValidationError as e:
+                log.exception(f"Validation error loading user valves: {e}")
+                params["__user__"]["valves"] = function_module.UserValves()
             except Exception as e:
                 log.exception(e)
                 params["__user__"]["valves"] = function_module.UserValves()
