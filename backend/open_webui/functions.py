@@ -3,6 +3,8 @@ import sys
 import inspect
 import json
 import asyncio
+import hashlib
+import hmac
 
 from pydantic import BaseModel
 from typing import AsyncGenerator, Generator, Iterator
@@ -57,6 +59,93 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
+def validate_valves(valves_dict: dict, valves_class) -> bool:
+    """
+    Validates that valve values are safe and match expected types.
+    Returns True if valid, False otherwise.
+    """
+    if not valves_dict:
+        return True
+    
+    try:
+        # Get the expected fields from the Valves class
+        if hasattr(valves_class, '__fields__'):
+            expected_fields = valves_class.__fields__
+            
+            # Check that all provided valves are expected
+            for key in valves_dict.keys():
+                if key not in expected_fields:
+                    log.warning(f"Unexpected valve key: {key}")
+                    return False
+            
+            # Validate types match expectations
+            for key, value in valves_dict.items():
+                if value is not None and key in expected_fields:
+                    expected_type = expected_fields[key].annotation
+                    # Basic type checking
+                    if hasattr(expected_type, '__origin__'):
+                        # Handle generic types
+                        continue
+                    if not isinstance(value, expected_type):
+                        # Try to convert basic types
+                        if expected_type in (int, float, str, bool):
+                            continue
+                        log.warning(f"Type mismatch for valve {key}: expected {expected_type}, got {type(value)}")
+                        return False
+        
+        return True
+    except Exception as e:
+        log.error(f"Error validating valves: {e}")
+        return False
+
+
+def sanitize_valve_value(value):
+    """
+    Sanitizes a single valve value to prevent code injection.
+    """
+    if value is None:
+        return None
+    
+    # If it's a string, check for dangerous patterns
+    if isinstance(value, str):
+        # Reject strings that look like code or system commands
+        dangerous_patterns = [
+            '__import__',
+            'exec(',
+            'eval(',
+            'compile(',
+            'os.system',
+            'subprocess',
+            '__builtins__',
+            '__globals__',
+            '__code__',
+            'open(',
+            'file(',
+        ]
+        
+        value_lower = value.lower()
+        for pattern in dangerous_patterns:
+            if pattern.lower() in value_lower:
+                log.warning(f"Potentially dangerous pattern detected in valve value: {pattern}")
+                raise ValueError(f"Invalid valve value: contains prohibited pattern")
+    
+    # For other basic types, return as-is
+    if isinstance(value, (int, float, bool, list, dict)):
+        # Recursively sanitize lists and dicts
+        if isinstance(value, list):
+            return [sanitize_valve_value(v) for v in value]
+        elif isinstance(value, dict):
+            return {k: sanitize_valve_value(v) for k, v in value.items()}
+        return value
+    
+    # For complex objects, only allow if they're from safe types
+    if hasattr(value, '__dict__'):
+        log.warning(f"Complex object passed as valve value: {type(value)}")
+        raise ValueError(f"Invalid valve value type: {type(value)}")
+    
+    return value
+
+
 def get_function_module_by_id(request: Request, pipe_id: str):
     function_module, _, _ = get_function_module_from_cache(request, pipe_id)
 
@@ -66,9 +155,23 @@ def get_function_module_by_id(request: Request, pipe_id: str):
 
         if valves:
             try:
-                function_module.valves = Valves(
-                    **{k: v for k, v in valves.items() if v is not None}
-                )
+                # Validate valves before using them
+                if not validate_valves(valves, Valves):
+                    log.error(f"Invalid valves configuration for function {pipe_id}")
+                    raise ValueError("Invalid valves configuration")
+                
+                # Sanitize valve values
+                sanitized_valves = {}
+                for k, v in valves.items():
+                    if v is not None:
+                        try:
+                            sanitized_valves[k] = sanitize_valve_value(v)
+                        except ValueError as e:
+                            log.error(f"Error sanitizing valve {k} for function {pipe_id}: {e}")
+                            raise ValueError(f"Invalid valve value for {k}")
+                
+                # Create valves instance with sanitized values
+                function_module.valves = Valves(**sanitized_valves)
             except Exception as e:
                 log.exception(f"Error loading valves for function {pipe_id}: {e}")
                 raise e
@@ -212,7 +315,18 @@ async def generate_function_chat_completion(
         if "__user__" in params and hasattr(function_module, "UserValves"):
             user_valves = Functions.get_user_valves_by_id_and_user_id(pipe_id, user.id)
             try:
-                params["__user__"]["valves"] = function_module.UserValves(**user_valves)
+                # Validate and sanitize user valves
+                if validate_valves(user_valves, function_module.UserValves):
+                    sanitized_user_valves = {}
+                    for k, v in user_valves.items():
+                        try:
+                            sanitized_user_valves[k] = sanitize_valve_value(v)
+                        except ValueError as e:
+                            log.error(f"Error sanitizing user valve {k}: {e}")
+                            continue
+                    params["__user__"]["valves"] = function_module.UserValves(**sanitized_user_valves)
+                else:
+                    params["__user__"]["valves"] = function_module.UserValves()
             except Exception as e:
                 log.exception(e)
                 params["__user__"]["valves"] = function_module.UserValves()
