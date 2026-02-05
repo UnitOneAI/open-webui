@@ -349,14 +349,6 @@ jobs:
           VULN_SEVERITY=$(cat security-report.json | jq -r '.vulnerabilities[0].severity // "medium"')
           TOTAL=$(cat security-report.json | jq '.total // 0')
 
-          # Map severity to priority
-          case "$VULN_SEVERITY" in
-            critical) PRIORITY="Highest" ;;
-            high) PRIORITY="High" ;;
-            medium) PRIORITY="Medium" ;;
-            *) PRIORITY="Low" ;;
-          esac
-
           # Get PR URL from previous step
           PR_URL="${{ steps.create_pr.outputs.pr_url }}"
           if [ -z "$PR_URL" ]; then
@@ -366,7 +358,7 @@ jobs:
           echo "Creating Jira ticket..."
           echo "PR URL: $PR_URL"
 
-          # Create Jira ticket
+          # Create Jira ticket (simplified - no priority/labels to avoid field errors)
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$JIRA_URL/rest/api/3/issue" \
             -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -H "Content-Type: application/json" \
@@ -381,13 +373,41 @@ jobs:
                     \"type\": \"paragraph\",
                     \"content\": [{
                       \"type\": \"text\",
-                      \"text\": \"Security vulnerability detected by UnitOneFlow Security Guard.\\n\\nType: $VULN_TYPE\\nFile: $VULN_FILE\\nSeverity: $VULN_SEVERITY\\nTotal vulnerabilities: $TOTAL\\n\\nDescription: $VULN_DESC\\n\\nPull Request: $PR_URL\"
+                      \"text\": \"Security vulnerability detected by UnitOneFlow Security Guard.\"
+                    }]
+                  }, {
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"Type: $VULN_TYPE\"
+                    }]
+                  }, {
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"File: $VULN_FILE\"
+                    }]
+                  }, {
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"Severity: $VULN_SEVERITY\"
+                    }]
+                  }, {
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"Total vulnerabilities: $TOTAL\"
+                    }]
+                  }, {
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"Pull Request: $PR_URL\"
                     }]
                   }]
                 },
-                \"issuetype\": {\"name\": \"Task\"},
-                \"priority\": {\"name\": \"$PRIORITY\"},
-                \"labels\": [\"security\", \"automated\", \"unitoneflow\"]
+                \"issuetype\": {\"name\": \"Task\"}
               }
             }")
 
