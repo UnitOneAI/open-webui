@@ -3,6 +3,7 @@ import sys
 import inspect
 import json
 import asyncio
+import re
 
 from pydantic import BaseModel
 from typing import AsyncGenerator, Generator, Iterator
@@ -194,7 +195,13 @@ async def generate_function_chat_completion(
     def get_pipe_id(form_data: dict) -> str:
         pipe_id = form_data["model"]
         if "." in pipe_id:
-            pipe_id, _ = pipe_id.split(".", 1)
+            parts = pipe_id.split(".", 1)
+            if len(parts) == 2:
+                pipe_id = parts[0]
+        
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', pipe_id):
+            raise ValueError(f"Invalid pipe_id format: {pipe_id}")
+        
         return pipe_id
 
     def get_function_params(function_module, form_data, user, extra_params=None):

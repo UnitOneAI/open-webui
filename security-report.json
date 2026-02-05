@@ -1,0 +1,192 @@
+{
+  "summary": {
+    "total_vulnerabilities": 8,
+    "total_fixes": 8,
+    "by_severity": {
+      "high": 2,
+      "critical": 1,
+      "medium": 4,
+      "low": 1
+    }
+  },
+  "vulnerabilities": [
+    {
+      "vulnerability_type": "Insecure Deserialization",
+      "severity": "high",
+      "file_path": "open_webui/functions.py",
+      "line_number": 63,
+      "description": "The function loads and executes arbitrary function modules from cache/database without proper validation. The valves dictionary is unsafely unpacked into the Valves class constructor using **valves, which could allow arbitrary code execution if the database is compromised or contains malicious data.",
+      "vulnerable_code": "function_module.valves = Valves(\n    **{k: v for k, v in valves.items() if v is not None}\n)",
+      "recommendation": "Implement strict validation and sanitization of valve data before deserializing. Use a whitelist approach to validate all keys and value types. Consider using a safe configuration loader that doesn't allow arbitrary code execution."
+    },
+    {
+      "vulnerability_type": "Code Injection",
+      "severity": "critical",
+      "file_path": "open_webui/functions.py",
+      "line_number": 57,
+      "description": "The get_function_module_from_cache function loads and executes function modules dynamically. If an attacker can control the pipe_id or manipulate the cached modules, they could execute arbitrary code. The function module is then executed without sandboxing.",
+      "vulnerable_code": "function_module, _, _ = get_function_module_from_cache(request, pipe_id)",
+      "recommendation": "Implement strict validation of pipe_id values using a whitelist. Sandbox the execution of function modules using proper isolation techniques. Verify the integrity of cached modules using cryptographic signatures."
+    },
+    {
+      "vulnerability_type": "Improper Input Validation",
+      "severity": "medium",
+      "file_path": "open_webui/functions.py",
+      "line_number": 205,
+      "description": "The get_pipe_id function splits the model ID without validating the format or content, which could lead to unexpected behavior or security issues if malicious input is provided.",
+      "vulnerable_code": "pipe_id = form_data[\"model\"]\nif \".\" in pipe_id:\n    pipe_id, _ = pipe_id.split(\".\", 1)",
+      "recommendation": "Implement strict validation of the model ID format using a regex pattern. Validate that the pipe_id exists in an allowed list before processing."
+    },
+    {
+      "vulnerability_type": "Improper Input Validation",
+      "severity": "medium",
+      "file_path": "open_webui/functions.py",
+      "line_number": 213,
+      "description": "Function parameters are constructed by merging form_data and extra_params without proper validation. This could allow injection of unexpected parameters if form_data is user-controlled.",
+      "vulnerable_code": "params = {\"body\": form_data} | {\n    k: v for k, v in extra_params.items() if k in sig.parameters\n}",
+      "recommendation": "Implement strict validation of all form_data fields. Use a schema validator like Pydantic to ensure only expected fields with correct types are accepted. Sanitize all user input before processing."
+    },
+    {
+      "vulnerability_type": "Path Traversal",
+      "severity": "medium",
+      "file_path": "open_webui/config.py",
+      "line_number": 111,
+      "description": "The load_json_config function opens a file using a path constructed from DATA_DIR without validating that the resulting path is within the expected directory, potentially allowing path traversal attacks if DATA_DIR can be manipulated.",
+      "vulnerable_code": "with open(f\"{DATA_DIR}/config.json\", \"r\") as file:\n    return json.load(file)",
+      "recommendation": "Use os.path.abspath() and validate that the resolved path starts with the expected base directory. Use Path().resolve() to normalize the path and check containment."
+    },
+    {
+      "vulnerability_type": "Insecure Deserialization",
+      "severity": "high",
+      "file_path": "open_webui/config.py",
+      "line_number": 111,
+      "description": "The load_json_config function uses json.load() to deserialize configuration data without validation. If an attacker can modify config.json, they could inject malicious configuration values that could lead to code execution or other security issues.",
+      "vulnerable_code": "with open(f\"{DATA_DIR}/config.json\", \"r\") as file:\n    return json.load(file)",
+      "recommendation": "Validate the structure and contents of the JSON data after loading using a schema validator. Implement integrity checks (checksums/signatures) for configuration files. Use safe defaults if validation fails."
+    },
+    {
+      "vulnerability_type": "Improper Input Validation",
+      "severity": "medium",
+      "file_path": "open_webui/config.py",
+      "line_number": 159,
+      "description": "The get_config_value function uses user-provided config_path to traverse nested dictionary without validation. This could lead to unexpected behavior or information disclosure if path contains malicious values.",
+      "vulnerable_code": "path_parts = config_path.split(\".\")\ncur_config = CONFIG_DATA\nfor key in path_parts:\n    if key in cur_config:\n        cur_config = cur_config[key]",
+      "recommendation": "Implement strict validation of config_path using a whitelist of allowed paths. Limit the depth of traversal. Use a safe getter method that prevents accessing sensitive internal configurations."
+    },
+    {
+      "vulnerability_type": "SQL Injection",
+      "severity": "low",
+      "file_path": "open_webui/config.py",
+      "line_number": 152,
+      "description": "While using SQLAlchemy ORM which provides protection against SQL injection, the code doesn't show parameterization explicitly. If raw SQL queries are used elsewhere in the codebase with the Config model, there could be SQL injection risks.",
+      "vulnerable_code": "config_entry = db.query(Config).order_by(Config.id.desc()).first()",
+      "recommendation": "Ensure all database queries use SQLAlchemy ORM methods or parameterized queries. Never concatenate user input directly into SQL queries. Review all database access points in the codebase."
+    }
+  ],
+  "fixes": [
+    {
+      "file_path": "open_webui/functions.py",
+      "vulnerability": {
+        "vulnerability_type": "Code Injection",
+        "severity": "critical",
+        "file_path": "open_webui/functions.py",
+        "line_number": 57,
+        "description": "The get_function_module_from_cache function loads and executes function modules dynamically. If an attacker can control the pipe_id or manipulate the cached modules, they could execute arbitrary code. The function module is then executed without sandboxing.",
+        "vulnerable_code": "function_module, _, _ = get_function_module_from_cache(request, pipe_id)",
+        "recommendation": "Implement strict validation of pipe_id values using a whitelist. Sandbox the execution of function modules using proper isolation techniques. Verify the integrity of cached modules using cryptographic signatures."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/functions.py",
+      "vulnerability": {
+        "vulnerability_type": "Insecure Deserialization",
+        "severity": "high",
+        "file_path": "open_webui/functions.py",
+        "line_number": 63,
+        "description": "The function loads and executes arbitrary function modules from cache/database without proper validation. The valves dictionary is unsafely unpacked into the Valves class constructor using **valves, which could allow arbitrary code execution if the database is compromised or contains malicious data.",
+        "vulnerable_code": "function_module.valves = Valves(\n    **{k: v for k, v in valves.items() if v is not None}\n)",
+        "recommendation": "Implement strict validation and sanitization of valve data before deserializing. Use a whitelist approach to validate all keys and value types. Consider using a safe configuration loader that doesn't allow arbitrary code execution."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/config.py",
+      "vulnerability": {
+        "vulnerability_type": "Insecure Deserialization",
+        "severity": "high",
+        "file_path": "open_webui/config.py",
+        "line_number": 111,
+        "description": "The load_json_config function uses json.load() to deserialize configuration data without validation. If an attacker can modify config.json, they could inject malicious configuration values that could lead to code execution or other security issues.",
+        "vulnerable_code": "with open(f\"{DATA_DIR}/config.json\", \"r\") as file:\n    return json.load(file)",
+        "recommendation": "Validate the structure and contents of the JSON data after loading using a schema validator. Implement integrity checks (checksums/signatures) for configuration files. Use safe defaults if validation fails."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/functions.py",
+      "vulnerability": {
+        "vulnerability_type": "Improper Input Validation",
+        "severity": "medium",
+        "file_path": "open_webui/functions.py",
+        "line_number": 205,
+        "description": "The get_pipe_id function splits the model ID without validating the format or content, which could lead to unexpected behavior or security issues if malicious input is provided.",
+        "vulnerable_code": "pipe_id = form_data[\"model\"]\nif \".\" in pipe_id:\n    pipe_id, _ = pipe_id.split(\".\", 1)",
+        "recommendation": "Implement strict validation of the model ID format using a regex pattern. Validate that the pipe_id exists in an allowed list before processing."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/functions.py",
+      "vulnerability": {
+        "vulnerability_type": "Improper Input Validation",
+        "severity": "medium",
+        "file_path": "open_webui/functions.py",
+        "line_number": 213,
+        "description": "Function parameters are constructed by merging form_data and extra_params without proper validation. This could allow injection of unexpected parameters if form_data is user-controlled.",
+        "vulnerable_code": "params = {\"body\": form_data} | {\n    k: v for k, v in extra_params.items() if k in sig.parameters\n}",
+        "recommendation": "Implement strict validation of all form_data fields. Use a schema validator like Pydantic to ensure only expected fields with correct types are accepted. Sanitize all user input before processing."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/config.py",
+      "vulnerability": {
+        "vulnerability_type": "Path Traversal",
+        "severity": "medium",
+        "file_path": "open_webui/config.py",
+        "line_number": 111,
+        "description": "The load_json_config function opens a file using a path constructed from DATA_DIR without validating that the resulting path is within the expected directory, potentially allowing path traversal attacks if DATA_DIR can be manipulated.",
+        "vulnerable_code": "with open(f\"{DATA_DIR}/config.json\", \"r\") as file:\n    return json.load(file)",
+        "recommendation": "Use os.path.abspath() and validate that the resolved path starts with the expected base directory. Use Path().resolve() to normalize the path and check containment."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/config.py",
+      "vulnerability": {
+        "vulnerability_type": "Improper Input Validation",
+        "severity": "medium",
+        "file_path": "open_webui/config.py",
+        "line_number": 159,
+        "description": "The get_config_value function uses user-provided config_path to traverse nested dictionary without validation. This could lead to unexpected behavior or information disclosure if path contains malicious values.",
+        "vulnerable_code": "path_parts = config_path.split(\".\")\ncur_config = CONFIG_DATA\nfor key in path_parts:\n    if key in cur_config:\n        cur_config = cur_config[key]",
+        "recommendation": "Implement strict validation of config_path using a whitelist of allowed paths. Limit the depth of traversal. Use a safe getter method that prevents accessing sensitive internal configurations."
+      },
+      "has_fix": true
+    },
+    {
+      "file_path": "open_webui/config.py",
+      "vulnerability": {
+        "vulnerability_type": "SQL Injection",
+        "severity": "low",
+        "file_path": "open_webui/config.py",
+        "line_number": 152,
+        "description": "While using SQLAlchemy ORM which provides protection against SQL injection, the code doesn't show parameterization explicitly. If raw SQL queries are used elsewhere in the codebase with the Config model, there could be SQL injection risks.",
+        "vulnerable_code": "config_entry = db.query(Config).order_by(Config.id.desc()).first()",
+        "recommendation": "Ensure all database queries use SQLAlchemy ORM methods or parameterized queries. Never concatenate user input directly into SQL queries. Review all database access points in the codebase."
+      },
+      "has_fix": true
+    }
+  ]
+}
