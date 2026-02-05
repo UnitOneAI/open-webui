@@ -357,11 +357,17 @@ $DETAILS_TABLE
             *) PRIORITY="Low" ;;
           esac
 
-          # Get PR URL if available
-          PR_URL="${{ steps.create_pr.outputs.pr_url || 'PR pending' }}"
+          # Get PR URL from previous step
+          PR_URL="${{ steps.create_pr.outputs.pr_url }}"
+          if [ -z "$PR_URL" ]; then
+            PR_URL="PR creation pending"
+          fi
+
+          echo "Creating Jira ticket..."
+          echo "PR URL: $PR_URL"
 
           # Create Jira ticket
-          RESPONSE=$(curl -s -X POST "$JIRA_URL/rest/api/3/issue" \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$JIRA_URL/rest/api/3/issue" \
             -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{
@@ -385,11 +391,22 @@ $DETAILS_TABLE
               }
             }")
 
-          TICKET_KEY=$(echo "$RESPONSE" | jq -r '.key // "unknown"')
-          JIRA_TICKET_URL="$JIRA_URL/browse/$TICKET_KEY"
-          echo "jira_url=$JIRA_TICKET_URL" >> $GITHUB_OUTPUT
-          echo "jira_key=$TICKET_KEY" >> $GITHUB_OUTPUT
-          echo "Jira ticket created: $JIRA_TICKET_URL"
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Jira API response code: $HTTP_CODE"
+          echo "Jira API response: $BODY"
+
+          if [ "$HTTP_CODE" = "201" ]; then
+            TICKET_KEY=$(echo "$BODY" | jq -r '.key // "unknown"')
+            JIRA_TICKET_URL="$JIRA_URL/browse/$TICKET_KEY"
+            echo "jira_url=$JIRA_TICKET_URL" >> $GITHUB_OUTPUT
+            echo "jira_key=$TICKET_KEY" >> $GITHUB_OUTPUT
+            echo "✅ Jira ticket created: $JIRA_TICKET_URL"
+          else
+            echo "❌ Failed to create Jira ticket"
+            echo "jira_url=" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
