@@ -3,6 +3,8 @@ import sys
 import inspect
 import json
 import asyncio
+import hashlib
+from typing import Set
 
 from pydantic import BaseModel
 from typing import AsyncGenerator, Generator, Iterator
@@ -56,9 +58,98 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
+# Whitelist of allowed attributes for function modules
+ALLOWED_FUNCTION_ATTRIBUTES: Set[str] = {
+    "pipe",
+    "pipes",
+    "valves",
+    "Valves",
+    "UserValves",
+    "name",
+    "__name__",
+    "__doc__",
+}
+
+
+def validate_function_id(pipe_id: str) -> str:
+    """
+    Validate and sanitize function ID to prevent injection attacks.
+    Only allow alphanumeric characters, hyphens, underscores, and dots.
+    """
+    if not pipe_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid function ID: ID cannot be empty"
+        )
+    
+    # Remove any path traversal attempts
+    pipe_id = pipe_id.replace("..", "").replace("/", "").replace("\\", "")
+    
+    # Validate characters
+    allowed_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if not all(c in allowed_chars for c in pipe_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid function ID: contains invalid characters"
+        )
+    
+    return pipe_id
+
+
+def verify_function_integrity(pipe_id: str, function_module) -> bool:
+    """
+    Verify the integrity of the loaded function module.
+    Check that it only contains expected attributes.
+    """
+    # Get all attributes of the module
+    module_attrs = set(dir(function_module))
+    
+    # Get attributes that are not built-in Python attributes
+    custom_attrs = {attr for attr in module_attrs if not attr.startswith('_') or attr in ALLOWED_FUNCTION_ATTRIBUTES}
+    
+    # Check for suspicious attributes
+    suspicious_attrs = custom_attrs - ALLOWED_FUNCTION_ATTRIBUTES
+    
+    # Filter out harmless built-in attributes
+    harmless_builtins = {'__builtins__', '__file__', '__package__', '__loader__', '__spec__', '__cached__'}
+    suspicious_attrs = suspicious_attrs - harmless_builtins
+    
+    if suspicious_attrs:
+        log.warning(f"Function {pipe_id} contains unexpected attributes: {suspicious_attrs}")
+    
+    # Verify that the pipe function exists and is callable
+    if not hasattr(function_module, "pipe"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid function module: missing 'pipe' function"
+        )
+    
+    if not callable(getattr(function_module, "pipe")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid function module: 'pipe' is not callable"
+        )
+    
+    return True
+
 
 def get_function_module_by_id(request: Request, pipe_id: str):
+    # Validate and sanitize the pipe_id
+    pipe_id = validate_function_id(pipe_id)
+    
+    # Verify the function exists in the database and user has access
+    function_record = Functions.get_function_by_id(pipe_id)
+    if not function_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Function not found: {pipe_id}"
+        )
+    
+    # Load the function module from cache
     function_module, _, _ = get_function_module_from_cache(request, pipe_id)
+    
+    # Verify the integrity of the loaded module
+    verify_function_integrity(pipe_id, function_module)
 
     if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
         Valves = function_module.Valves
@@ -66,12 +157,23 @@ def get_function_module_by_id(request: Request, pipe_id: str):
 
         if valves:
             try:
-                function_module.valves = Valves(
-                    **{k: v for k, v in valves.items() if v is not None}
-                )
+                # Sanitize valve values to prevent injection
+                sanitized_valves = {}
+                for k, v in valves.items():
+                    if v is not None:
+                        # Convert to string and limit length to prevent DoS
+                        if isinstance(v, str) and len(v) > 10000:
+                            log.warning(f"Valve value for {k} exceeds maximum length, truncating")
+                            v = v[:10000]
+                        sanitized_valves[k] = v
+                
+                function_module.valves = Valves(**sanitized_valves)
             except Exception as e:
                 log.exception(f"Error loading valves for function {pipe_id}: {e}")
-                raise e
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error loading function valves: {str(e)}"
+                )
         else:
             function_module.valves = Valves()
 

@@ -227,29 +227,95 @@ WEBUI_BUILD_HASH = os.environ.get("WEBUI_BUILD_HASH", "dev-build")
 # DATA/FRONTEND BUILD DIR
 ####################################
 
-DATA_DIR = Path(os.getenv("DATA_DIR", BACKEND_DIR / "data")).resolve()
+def validate_data_dir(data_dir_path: Path, allowed_base_dirs: list[Path]) -> Path:
+    """
+    Validate that the data directory is within allowed base directories.
+    
+    Args:
+        data_dir_path: The resolved data directory path
+        allowed_base_dirs: List of allowed base directories
+        
+    Returns:
+        The validated data directory path
+        
+    Raises:
+        ValueError: If the data directory is outside allowed directories
+    """
+    data_dir_resolved = data_dir_path.resolve()
+    
+    # Check if the path is within any of the allowed base directories
+    for allowed_base in allowed_base_dirs:
+        allowed_base_resolved = allowed_base.resolve()
+        try:
+            data_dir_resolved.relative_to(allowed_base_resolved)
+            return data_dir_resolved
+        except ValueError:
+            continue
+    
+    # If we get here, the path is not within any allowed directory
+    raise ValueError(
+        f"DATA_DIR '{data_dir_path}' is outside allowed directories. "
+        f"Path must be within: {', '.join(str(d) for d in allowed_base_dirs)}"
+    )
+
+# Define allowed base directories for DATA_DIR
+ALLOWED_DATA_DIR_BASES = [BASE_DIR, BACKEND_DIR, OPEN_WEBUI_DIR]
+
+# Get and validate DATA_DIR
+data_dir_env = os.getenv("DATA_DIR", str(BACKEND_DIR / "data"))
+try:
+    DATA_DIR = validate_data_dir(Path(data_dir_env), ALLOWED_DATA_DIR_BASES)
+except ValueError as e:
+    log.error(f"Invalid DATA_DIR configuration: {e}")
+    log.warning(f"Falling back to default: {BACKEND_DIR / 'data'}")
+    DATA_DIR = (BACKEND_DIR / "data").resolve()
 
 if FROM_INIT_PY:
-    NEW_DATA_DIR = Path(os.getenv("DATA_DIR", OPEN_WEBUI_DIR / "data")).resolve()
+    new_data_dir_env = os.getenv("DATA_DIR", str(OPEN_WEBUI_DIR / "data"))
+    try:
+        NEW_DATA_DIR = validate_data_dir(Path(new_data_dir_env), ALLOWED_DATA_DIR_BASES)
+    except ValueError as e:
+        log.error(f"Invalid NEW_DATA_DIR configuration: {e}")
+        log.warning(f"Falling back to default: {OPEN_WEBUI_DIR / 'data'}")
+        NEW_DATA_DIR = (OPEN_WEBUI_DIR / "data").resolve()
+    
     NEW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Check if the data directory exists in the package directory
     if DATA_DIR.exists() and DATA_DIR != NEW_DATA_DIR:
         log.info(f"Moving {DATA_DIR} to {NEW_DATA_DIR}")
-        for item in DATA_DIR.iterdir():
-            dest = NEW_DATA_DIR / item.name
-            if item.is_dir():
-                shutil.copytree(item, dest, dirs_exist_ok=True)
+        try:
+            for item in DATA_DIR.iterdir():
+                # Validate that the destination is still within NEW_DATA_DIR
+                dest = NEW_DATA_DIR / item.name
+                if not dest.resolve().is_relative_to(NEW_DATA_DIR.resolve()):
+                    log.error(f"Skipping {item.name}: destination would be outside NEW_DATA_DIR")
+                    continue
+                    
+                if item.is_dir():
+                    shutil.copytree(item, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest)
+
+            # Zip the data directory
+            archive_dest = DATA_DIR.parent / "open_webui_data"
+            if archive_dest.resolve().is_relative_to(DATA_DIR.parent.resolve()):
+                shutil.make_archive(str(archive_dest), "zip", DATA_DIR)
             else:
-                shutil.copy2(item, dest)
+                log.error("Archive destination would be outside allowed directory")
 
-        # Zip the data directory
-        shutil.make_archive(DATA_DIR.parent / "open_webui_data", "zip", DATA_DIR)
+            # Remove the old data directory
+            shutil.rmtree(DATA_DIR)
+        except Exception as e:
+            log.error(f"Error during data directory migration: {e}")
 
-        # Remove the old data directory
-        shutil.rmtree(DATA_DIR)
-
-    DATA_DIR = Path(os.getenv("DATA_DIR", OPEN_WEBUI_DIR / "data"))
+    data_dir_final_env = os.getenv("DATA_DIR", str(OPEN_WEBUI_DIR / "data"))
+    try:
+        DATA_DIR = validate_data_dir(Path(data_dir_final_env), ALLOWED_DATA_DIR_BASES)
+    except ValueError as e:
+        log.error(f"Invalid final DATA_DIR configuration: {e}")
+        log.warning(f"Falling back to default: {OPEN_WEBUI_DIR / 'data'}")
+        DATA_DIR = (OPEN_WEBUI_DIR / "data").resolve()
 
 STATIC_DIR = Path(os.getenv("STATIC_DIR", OPEN_WEBUI_DIR / "static"))
 
@@ -720,96 +786,4 @@ AUDIT_UVICORN_LOGGER_NAMES = os.getenv(
 # METADATA | REQUEST | REQUEST_RESPONSE
 AUDIT_LOG_LEVEL = os.getenv("AUDIT_LOG_LEVEL", "NONE").upper()
 try:
-    MAX_BODY_LOG_SIZE = int(os.environ.get("MAX_BODY_LOG_SIZE") or 2048)
-except ValueError:
-    MAX_BODY_LOG_SIZE = 2048
-
-# Comma separated list for urls to exclude from audit
-AUDIT_EXCLUDED_PATHS = os.getenv("AUDIT_EXCLUDED_PATHS", "/chats,/chat,/folders").split(
-    ","
-)
-AUDIT_EXCLUDED_PATHS = [path.strip() for path in AUDIT_EXCLUDED_PATHS]
-AUDIT_EXCLUDED_PATHS = [path.lstrip("/") for path in AUDIT_EXCLUDED_PATHS]
-
-
-####################################
-# OPENTELEMETRY
-####################################
-
-ENABLE_OTEL = os.environ.get("ENABLE_OTEL", "False").lower() == "true"
-ENABLE_OTEL_TRACES = os.environ.get("ENABLE_OTEL_TRACES", "False").lower() == "true"
-ENABLE_OTEL_METRICS = os.environ.get("ENABLE_OTEL_METRICS", "False").lower() == "true"
-ENABLE_OTEL_LOGS = os.environ.get("ENABLE_OTEL_LOGS", "False").lower() == "true"
-
-OTEL_EXPORTER_OTLP_ENDPOINT = os.environ.get(
-    "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"
-)
-OTEL_METRICS_EXPORTER_OTLP_ENDPOINT = os.environ.get(
-    "OTEL_METRICS_EXPORTER_OTLP_ENDPOINT", OTEL_EXPORTER_OTLP_ENDPOINT
-)
-OTEL_LOGS_EXPORTER_OTLP_ENDPOINT = os.environ.get(
-    "OTEL_LOGS_EXPORTER_OTLP_ENDPOINT", OTEL_EXPORTER_OTLP_ENDPOINT
-)
-OTEL_EXPORTER_OTLP_INSECURE = (
-    os.environ.get("OTEL_EXPORTER_OTLP_INSECURE", "False").lower() == "true"
-)
-OTEL_METRICS_EXPORTER_OTLP_INSECURE = (
-    os.environ.get(
-        "OTEL_METRICS_EXPORTER_OTLP_INSECURE", str(OTEL_EXPORTER_OTLP_INSECURE)
-    ).lower()
-    == "true"
-)
-OTEL_LOGS_EXPORTER_OTLP_INSECURE = (
-    os.environ.get(
-        "OTEL_LOGS_EXPORTER_OTLP_INSECURE", str(OTEL_EXPORTER_OTLP_INSECURE)
-    ).lower()
-    == "true"
-)
-OTEL_SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "open-webui")
-OTEL_RESOURCE_ATTRIBUTES = os.environ.get(
-    "OTEL_RESOURCE_ATTRIBUTES", ""
-)  # e.g. key1=val1,key2=val2
-OTEL_TRACES_SAMPLER = os.environ.get(
-    "OTEL_TRACES_SAMPLER", "parentbased_always_on"
-).lower()
-OTEL_BASIC_AUTH_USERNAME = os.environ.get("OTEL_BASIC_AUTH_USERNAME", "")
-OTEL_BASIC_AUTH_PASSWORD = os.environ.get("OTEL_BASIC_AUTH_PASSWORD", "")
-
-OTEL_METRICS_BASIC_AUTH_USERNAME = os.environ.get(
-    "OTEL_METRICS_BASIC_AUTH_USERNAME", OTEL_BASIC_AUTH_USERNAME
-)
-OTEL_METRICS_BASIC_AUTH_PASSWORD = os.environ.get(
-    "OTEL_METRICS_BASIC_AUTH_PASSWORD", OTEL_BASIC_AUTH_PASSWORD
-)
-OTEL_LOGS_BASIC_AUTH_USERNAME = os.environ.get(
-    "OTEL_LOGS_BASIC_AUTH_USERNAME", OTEL_BASIC_AUTH_USERNAME
-)
-OTEL_LOGS_BASIC_AUTH_PASSWORD = os.environ.get(
-    "OTEL_LOGS_BASIC_AUTH_PASSWORD", OTEL_BASIC_AUTH_PASSWORD
-)
-
-OTEL_OTLP_SPAN_EXPORTER = os.environ.get(
-    "OTEL_OTLP_SPAN_EXPORTER", "grpc"
-).lower()  # grpc or http
-
-OTEL_METRICS_OTLP_SPAN_EXPORTER = os.environ.get(
-    "OTEL_METRICS_OTLP_SPAN_EXPORTER", OTEL_OTLP_SPAN_EXPORTER
-).lower()  # grpc or http
-
-OTEL_LOGS_OTLP_SPAN_EXPORTER = os.environ.get(
-    "OTEL_LOGS_OTLP_SPAN_EXPORTER", OTEL_OTLP_SPAN_EXPORTER
-).lower()  # grpc or http
-
-####################################
-# TOOLS/FUNCTIONS PIP OPTIONS
-####################################
-
-PIP_OPTIONS = os.getenv("PIP_OPTIONS", "").split()
-PIP_PACKAGE_INDEX_OPTIONS = os.getenv("PIP_PACKAGE_INDEX_OPTIONS", "").split()
-
-
-####################################
-# PROGRESSIVE WEB APP OPTIONS
-####################################
-
-EXTERNAL_PWA_MANIFEST_URL = os.environ.get("EXTERNAL_PWA_MANIFEST_URL")
+    MAX_BODY_LOG_SIZE = int(os.environ.get("MAX_BODY_LOG_SIZE")
