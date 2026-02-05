@@ -219,14 +219,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Check for changes in backend
           cd backend
-
-          # Check for changes
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet; then
-            echo "No changes to commit"
+          if git diff --quiet -- . ':!manifest.json' ':!security-report.json'; then
+            echo "No code changes to commit"
             echo "pr_created=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -235,8 +234,8 @@ jobs:
           BRANCH_NAME="fix/security-$(date +%Y%m%d-%H%M%S)"
           git checkout -b "$BRANCH_NAME"
 
-          # Commit changes
-          git add -A
+          # Commit ONLY the Python files that were fixed (exclude workflow, manifest, reports)
+          git diff --name-only HEAD | grep '\.py$' | xargs -r git add
           git commit -m "fix: Security vulnerability fixes
 
           Automated fixes by UnitOneFlow Security Guard.
