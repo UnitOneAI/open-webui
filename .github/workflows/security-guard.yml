@@ -420,10 +420,12 @@ jobs:
           if [ "$HTTP_CODE" = "201" ]; then
             TICKET_KEY=$(echo "$BODY" | jq -r '.key // ""')
             if [ -n "$TICKET_KEY" ] && [ "$TICKET_KEY" != "null" ]; then
-              # Construct full Jira URL - ensure base URL is valid
+              # Construct full Jira URL - ensure base URL has https://
               JIRA_BASE="${JIRA_URL%/}"  # Remove trailing slash if present
               if [ -z "$JIRA_BASE" ]; then
                 JIRA_BASE="https://unitoneai.atlassian.net"
+              elif [[ "$JIRA_BASE" != http* ]]; then
+                JIRA_BASE="https://${JIRA_BASE}"
               fi
               JIRA_TICKET_URL="${JIRA_BASE}/browse/${TICKET_KEY}"
               echo "jira_url=$JIRA_TICKET_URL" >> $GITHUB_OUTPUT
