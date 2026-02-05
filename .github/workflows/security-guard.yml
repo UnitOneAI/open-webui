@@ -1,0 +1,334 @@
+name: Security Guard
+
+on:
+  push:
+    branches: [main, security-demo-clean]
+  workflow_dispatch:
+
+jobs:
+  security-scan-and-fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install anthropic requests pyyaml
+
+      - name: Install UnitOneFlow
+        run: |
+          pip install https://devflow-scanned-repos-dev.s3.us-west-2.amazonaws.com/public/wheels/unitoneflow-1.0.0-py3-none-any.whl
+
+      - name: Generate manifest
+        run: |
+          echo "🔍 Scanning codebase..."
+          cd backend
+          python -c "
+          import ast
+          import json
+          from pathlib import Path
+
+          def extract_functions(file_path):
+              functions = []
+              try:
+                  content = file_path.read_text()
+                  tree = ast.parse(content)
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.FunctionDef):
+                          functions.append({
+                              'name': node.name,
+                              'file_path': str(file_path),
+                              'line_number': node.lineno,
+                              'end_line': node.end_lineno or node.lineno,
+                              'docstring': ast.get_docstring(node) or ''
+                          })
+              except:
+                  pass
+              return functions
+
+          all_functions = []
+          for py_file in Path('.').rglob('*.py'):
+              if any(skip in str(py_file) for skip in ['venv', '__pycache__', 'test']):
+                  continue
+              for func in extract_functions(py_file):
+                  func['file_path'] = str(py_file)
+                  all_functions.append(func)
+
+          manifest = {'functions': all_functions, 'files_scanned': len(list(Path('.').rglob('*.py')))}
+          Path('manifest.json').write_text(json.dumps(manifest, indent=2))
+          print(f'Created manifest with {len(all_functions)} functions')
+          "
+
+      - name: Detect vulnerabilities
+        id: detect
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cd backend
+          python -c "
+          import anthropic
+          import json
+          from pathlib import Path
+
+          client = anthropic.Anthropic()
+          manifest = json.loads(Path('manifest.json').read_text())
+
+          # Build code context
+          code_context = []
+          seen_files = set()
+          for func in manifest.get('functions', [])[:20]:
+              fp = func.get('file_path', '')
+              if fp in seen_files:
+                  continue
+              seen_files.add(fp)
+              p = Path(fp)
+              if p.exists():
+                  code_context.append(f'### {fp}\n\`\`\`python\n{p.read_text()[:8000]}\n\`\`\`')
+
+          prompt = '''Analyze this Python codebase for security vulnerabilities.
+          Focus on: SQL Injection, Command Injection, Path Traversal, Code Injection, Insecure Deserialization.
+
+          Code Files:
+          ''' + chr(10).join(code_context) + '''
+
+          For EACH vulnerability found, respond with a JSON array:
+          [{\"vulnerability_type\": \"...\", \"severity\": \"critical|high|medium|low\", \"file_path\": \"...\", \"line_number\": 0, \"description\": \"...\", \"vulnerable_code\": \"...\", \"recommendation\": \"...\"}]
+          If none found: []
+          Only output valid JSON.'''
+
+          response = client.messages.create(model='claude-sonnet-4-5-20250929', max_tokens=4096, messages=[{'role': 'user', 'content': prompt}])
+          text = response.content[0].text.strip()
+
+          try:
+              if text.startswith('['):
+                  vulns = json.loads(text)
+              else:
+                  start, end = text.find('['), text.rfind(']') + 1
+                  vulns = json.loads(text[start:end]) if start >= 0 else []
+          except:
+              vulns = []
+
+          Path('security-report.json').write_text(json.dumps({'vulnerabilities': vulns, 'total': len(vulns)}, indent=2))
+          print(f'Found {len(vulns)} vulnerabilities')
+
+          # Set output
+          with open('$GITHUB_OUTPUT', 'a') as f:
+              f.write(f'count={len(vulns)}\n')
+              f.write(f'found={\"true\" if vulns else \"false\"}\n')
+          " 2>&1 || echo "Detection completed"
+
+          if [ -f security-report.json ]; then
+            VULN_COUNT=$(cat security-report.json | jq '.total // 0')
+            echo "count=$VULN_COUNT" >> $GITHUB_OUTPUT
+            if [ "$VULN_COUNT" -gt 0 ]; then
+              echo "found=true" >> $GITHUB_OUTPUT
+            else
+              echo "found=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate and apply fixes
+        if: steps.detect.outputs.found == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cd backend
+          python -c "
+          import anthropic
+          import json
+          from pathlib import Path
+
+          client = anthropic.Anthropic()
+          report = json.loads(Path('security-report.json').read_text())
+          vulns = report.get('vulnerabilities', [])
+
+          for vuln in vulns[:3]:  # Fix top 3 vulnerabilities
+              fp = vuln.get('file_path')
+              if not fp:
+                  continue
+              p = Path(fp)
+              if not p.exists():
+                  continue
+
+              original = p.read_text()
+              prompt = f'''Fix this security vulnerability:
+          Type: {vuln.get('vulnerability_type')}
+          File: {fp}
+          Line: {vuln.get('line_number')}
+          Issue: {vuln.get('description')}
+          Code: {vuln.get('vulnerable_code')}
+
+          Original file:
+          \`\`\`python
+          {original}
+          \`\`\`
+
+          Provide the COMPLETE fixed file. Only output code, no explanations.'''
+
+              response = client.messages.create(model='claude-sonnet-4-5-20250929', max_tokens=8192, messages=[{'role': 'user', 'content': prompt}])
+              fixed = response.content[0].text.strip()
+
+              if '\`\`\`' in fixed:
+                  lines = fixed.split('\n')
+                  in_code = False
+                  code_lines = []
+                  for line in lines:
+                      if line.startswith('\`\`\`') and not in_code:
+                          in_code = True
+                          continue
+                      elif line.startswith('\`\`\`') and in_code:
+                          break
+                      elif in_code:
+                          code_lines.append(line)
+                  if code_lines:
+                      fixed = '\n'.join(code_lines)
+
+              # Validate fix doesn't truncate file significantly
+              if len(fixed) > len(original) * 0.5:
+                  p.write_text(fixed)
+                  print(f'Fixed: {fp}')
+              else:
+                  print(f'Skipped {fp} - fix too short')
+          "
+
+      - name: Create PR with fixes
+        if: steps.detect.outputs.found == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd backend
+
+          # Check for changes
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "No changes to commit"
+            echo "pr_created=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Create branch
+          BRANCH_NAME="fix/security-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH_NAME"
+
+          # Commit changes
+          git add -A
+          git commit -m "fix: Security vulnerability fixes
+
+          Automated fixes by UnitOneFlow Security Guard.
+
+          Vulnerabilities addressed: ${{ steps.detect.outputs.count }}
+
+          See security-report.json for details."
+
+          # Push branch
+          git push -u origin "$BRANCH_NAME"
+
+          # Create PR
+          PR_URL=$(gh pr create \
+            --title "[Security] Fix ${{ steps.detect.outputs.count }} vulnerability(s)" \
+            --body "## Security Vulnerability Fixes
+
+          **Automated by UnitOneFlow Security Guard**
+
+          ### Summary
+          - Vulnerabilities detected: ${{ steps.detect.outputs.count }}
+          - Fixes applied: See diff
+
+          ### Details
+          See \`security-report.json\` in artifacts.
+
+          ---
+          *Generated by [UnitOneFlow](https://github.com/UnitOneAI/unitoneflow)*" \
+            --base "${{ github.ref_name }}")
+
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "pr_created=true" >> $GITHUB_OUTPUT
+          echo "PR created: $PR_URL"
+
+      - name: Create Jira ticket
+        if: steps.detect.outputs.found == 'true'
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT: ${{ secrets.JIRA_PROJECT }}
+        run: |
+          cd backend
+
+          if [ -z "$JIRA_URL" ]; then
+            echo "Jira not configured, skipping"
+            exit 0
+          fi
+
+          # Get vulnerability details
+          VULN_TYPE=$(cat security-report.json | jq -r '.vulnerabilities[0].vulnerability_type // "Security Issue"')
+          VULN_FILE=$(cat security-report.json | jq -r '.vulnerabilities[0].file_path // "unknown"')
+          VULN_DESC=$(cat security-report.json | jq -r '.vulnerabilities[0].description // "Security vulnerability detected"')
+          VULN_SEVERITY=$(cat security-report.json | jq -r '.vulnerabilities[0].severity // "medium"')
+          TOTAL=$(cat security-report.json | jq '.total // 0')
+
+          # Map severity to priority
+          case "$VULN_SEVERITY" in
+            critical) PRIORITY="Highest" ;;
+            high) PRIORITY="High" ;;
+            medium) PRIORITY="Medium" ;;
+            *) PRIORITY="Low" ;;
+          esac
+
+          # Get PR URL if available
+          PR_URL="${{ steps.create_pr.outputs.pr_url || 'PR pending' }}"
+
+          # Create Jira ticket
+          RESPONSE=$(curl -s -X POST "$JIRA_URL/rest/api/3/issue" \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"fields\": {
+                \"project\": {\"key\": \"$JIRA_PROJECT\"},
+                \"summary\": \"[Security] $VULN_TYPE in $VULN_FILE\",
+                \"description\": {
+                  \"type\": \"doc\",
+                  \"version\": 1,
+                  \"content\": [{
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"Security vulnerability detected by UnitOneFlow Security Guard.\\n\\nType: $VULN_TYPE\\nFile: $VULN_FILE\\nSeverity: $VULN_SEVERITY\\nTotal vulnerabilities: $TOTAL\\n\\nDescription: $VULN_DESC\\n\\nPull Request: $PR_URL\"
+                    }]
+                  }]
+                },
+                \"issuetype\": {\"name\": \"Bug\"},
+                \"priority\": {\"name\": \"$PRIORITY\"},
+                \"labels\": [\"security\", \"automated\", \"unitoneflow\"]
+              }
+            }")
+
+          TICKET_KEY=$(echo "$RESPONSE" | jq -r '.key // "unknown"')
+          echo "Jira ticket created: $JIRA_URL/browse/$TICKET_KEY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            backend/manifest.json
+            backend/security-report.json
