@@ -58,6 +58,21 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
 def get_function_module_by_id(request: Request, pipe_id: str):
+    # Validate that the function exists in the database and is authorized
+    function = Functions.get_function_by_id(pipe_id.split('.')[0])
+    if not function:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Function not found"
+        )
+    
+    # Verify the function is active
+    if not function.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Function is not active"
+        )
+    
     function_module, _, _ = get_function_module_from_cache(request, pipe_id)
 
     if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
@@ -160,10 +175,32 @@ async def generate_function_chat_completion(
     request, form_data, user, models: dict = {}
 ):
     async def execute_pipe(pipe, params):
-        if inspect.iscoroutinefunction(pipe):
-            return await pipe(**params)
-        else:
-            return pipe(**params)
+        # Validate that pipe is callable and from a trusted source
+        if not callable(pipe):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Invalid pipe function"
+            )
+        
+        # Verify the pipe function has the expected signature
+        sig = inspect.signature(pipe)
+        param_names = set(sig.parameters.keys())
+        provided_params = set(params.keys())
+        
+        # Only pass parameters that the function expects
+        filtered_params = {k: v for k, v in params.items() if k in param_names}
+        
+        try:
+            if inspect.iscoroutinefunction(pipe):
+                return await pipe(**filtered_params)
+            else:
+                return pipe(**filtered_params)
+        except Exception as e:
+            log.error(f"Error executing pipe: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Pipe execution failed: {str(e)}"
+            )
 
     async def get_message_content(res: str | Generator | AsyncGenerator) -> str:
         if isinstance(res, str):
@@ -291,6 +328,13 @@ async def generate_function_chat_completion(
 
     pipe_id = get_pipe_id(form_data)
     function_module = get_function_module_by_id(request, pipe_id)
+
+    # Verify the function module has a pipe attribute and it's callable
+    if not hasattr(function_module, "pipe"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Function module does not have a pipe method"
+        )
 
     pipe = function_module.pipe
     params = get_function_params(function_module, form_data, user, extra_params)
