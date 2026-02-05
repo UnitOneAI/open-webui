@@ -419,14 +419,16 @@ jobs:
 
           if [ "$HTTP_CODE" = "201" ]; then
             TICKET_KEY=$(echo "$BODY" | jq -r '.key // ""')
-            echo "DEBUG: Extracted TICKET_KEY=$TICKET_KEY"
-            echo "DEBUG: JIRA_URL env=$JIRA_URL"
             if [ -n "$TICKET_KEY" ] && [ "$TICKET_KEY" != "null" ]; then
-              # Always use hardcoded Jira base URL for reliability
-              JIRA_TICKET_URL="https://unitoneai.atlassian.net/browse/${TICKET_KEY}"
+              # Construct Jira URL from secret, ensuring https:// prefix
+              JIRA_BASE="${JIRA_URL%/}"
+              if [[ "$JIRA_BASE" != http* ]]; then
+                JIRA_BASE="https://${JIRA_BASE}"
+              fi
+              JIRA_TICKET_URL="${JIRA_BASE}/browse/${TICKET_KEY}"
               echo "jira_url=$JIRA_TICKET_URL" >> $GITHUB_OUTPUT
               echo "jira_key=$TICKET_KEY" >> $GITHUB_OUTPUT
-              echo "✅ Jira ticket created: $JIRA_TICKET_URL"
+              echo "✅ Jira ticket created successfully"
             else
               echo "❌ Jira ticket created but could not parse key"
               echo "jira_url=" >> $GITHUB_OUTPUT
@@ -458,10 +460,11 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
-          JIRA_URL="${{ steps.create_jira.outputs.jira_url }}"
-          if [ -n "$JIRA_URL" ] && [[ "$JIRA_URL" == http* ]]; then
+          JIRA_LINK="${{ steps.create_jira.outputs.jira_url }}"
+          JIRA_KEY="${{ steps.create_jira.outputs.jira_key }}"
+          if [ -n "$JIRA_LINK" ] && [[ "$JIRA_LINK" == http* ]]; then
             echo "### 🎫 Jira Ticket" >> $GITHUB_STEP_SUMMARY
-            echo "$JIRA_URL" >> $GITHUB_STEP_SUMMARY
+            echo "[${JIRA_KEY}](${JIRA_LINK})" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
